@@ -1,0 +1,241 @@
+import os
+import requests
+import time
+import re
+import logging
+from datetime import datetime
+
+# 配置日志
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# 从GitHub Secrets获取配置
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+ADMIN_USERNAMES = os.environ.get('ADMIN_USERNAMES', '@touin77').split(',')
+
+if not BOT_TOKEN:
+    logger.error("❌ 未设置 BOT_TOKEN")
+    exit(1)
+
+class GitHubCasinoBot:
+    def __init__(self):
+        self.base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+        self.last_update_id = 0
+        self.users = {}  # 内存数据库
+        logger.info("🤖 快三机器人启动成功")
+    
+    def send_message(self, chat_id, text):
+        url = f"{self.base_url}/sendMessage"
+        data = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        try:
+            response = requests.post(url, json=data, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"发送消息失败: {e}")
+            return False
+    
+    def get_user(self, user_id, username):
+        if user_id not in self.users:
+            self.users[user_id] = {
+                'username': username,
+                'balance': 1000.0,
+                'total_deposit': 0.0
+            }
+        return self.users[user_id]
+    
+    def update_balance(self, user_id, amount, note=""):
+        if user_id in self.users:
+            self.users[user_id]['balance'] += amount
+            if amount > 0:
+                self.users[user_id]['total_deposit'] += amount
+            logger.info(f"用户 {user_id} 余额更新: {amount}, 备注: {note}")
+    
+    def process_message(self, message):
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+        user_id = message["from"]["id"]
+        username = f"@{message['from'].get('username', 'unknown')}"
+        
+        user = self.get_user(user_id, username)
+        
+        if text == "/start":
+            self.send_message(chat_id,
+                f"🎲 <b>快三娱乐机器人</b>\n\n"
+                f"👤 欢迎 {username}\n"
+                f"💰 当前余额: <b>{user['balance']:.2f}</b>\n\n"
+                f"🎯 <b>下注格式：</b>\n"
+                f"• 大 100\n• 小 50\n• 单 30\n• 双 20\n\n"
+                f"发送3个骰子 🎲 开始游戏！\n\n"
+                f"👑 管理员命令：\n"
+                f"/add @用户名 金额\n"
+                f"/users - 查看用户列表"
+            )
+        
+        elif text.startswith("/add"):
+            if username not in ADMIN_USERNAMES:
+                self.send_message(chat_id, "❌ 无权限执行此操作")
+                return
+            
+            match = re.match(r'^/add\s+(@\w+)\s+(\d+(?:\.\d+)?)$', text)
+            if match:
+                target_username = match.group(1)
+                amount = float(match.group(2))
+                
+                # 查找目标用户
+                target_user_id = None
+                for uid, user_data in self.users.items():
+                    if user_data['username'] == target_username:
+                        target_user_id = uid
+                        break
+                
+                if target_user_id:
+                    self.update_balance(target_user_id, amount, f"管理员 {username} 充值")
+                    new_balance = self.users[target_user_id]['balance']
+                    self.send_message(chat_id,
+                        f"✅ <b>充值成功！</b>\n\n"
+                        f"👤 用户: {target_username}\n"
+                        f"💰 金额: {amount:.2f}\n"
+                        f"📊 新余额: {new_balance:.2f}\n"
+                        f"👑 操作人: {username}"
+                    )
+                else:
+                    self.send_message(chat_id, f"❌ 用户 {target_username} 不存在")
+            else:
+                self.send_message(chat_id, "❌ 格式错误！使用: /add @用户名 金额")
+        
+        elif text == "/users":
+            if username not in ADMIN_USERNAMES:
+                self.send_message(chat_id, "❌ 无权限查看用户列表")
+                return
+            
+            if not self.users:
+                self.send_message(chat_id, "暂无用户数据")
+                return
+            
+            users_text = "👥 <b>用户列表</b>\n\n"
+            total_balance = 0
+            total_deposit = 0
+            
+            for user_data in self.users.values():
+                users_text += f"👤 {user_data['username']}\n"
+                users_text += f"💰 余额: {user_data['balance']:.2f}\n"
+                users_text += f"📈 充值: {user_data['total_deposit']:.2f}\n"
+                users_text += "─" * 20 + "\n"
+                
+                total_balance += user_data['balance']
+                total_deposit += user_data['total_deposit']
+            
+            users_text += f"\n📊 <b>系统统计</b>\n"
+            users_text += f"总用户数: {len(self.users)}\n"
+            users_text += f"总余额: {total_balance:.2f}\n"
+            users_text += f"总充值: {total_deposit:.2f}"
+            
+            self.send_message(chat_id, users_text)
+        
+        elif re.match(r'^(大|小|单|双)\s+\d+(?:\.\d+)?$', text):
+            parts = text.split()
+            bet_type = parts[0]
+            amount = float(parts[1])
+            
+            if amount > user['balance']:
+                self.send_message(chat_id, f"❌ 余额不足！当前余额: {user['balance']:.2f}")
+                return
+            
+            if amount <= 0:
+                self.send_message(chat_id, "❌ 下注金额必须大于0")
+                return
+            
+            # 扣款
+            self.update_balance(user_id, -amount, f"下注{bet_type}")
+            
+            new_balance = user['balance']
+            self.send_message(chat_id,
+                f"✅ <b>下注成功！</b>\n\n"
+                f"🎯 下注: {bet_type}\n"
+                f"💰 金额: {amount:.2f}\n"
+                f"📊 余额: {new_balance:.2f}\n\n"
+                f"请发送3个骰子 🎲 开始游戏！"
+            )
+        
+        elif "dice" in message:
+            # 模拟骰子游戏
+            import random
+            dice1 = random.randint(1, 6)
+            dice2 = random.randint(1, 6)
+            dice3 = random.randint(1, 6)
+            total = dice1 + dice2 + dice3
+            
+            result = "大" if total > 10 else "小"
+            result += "单" if total % 2 == 1 else "双"
+            
+            # 模拟中奖（50%概率）
+            if random.random() > 0.5:
+                win_amount = 100.0
+                self.update_balance(user_id, win_amount, "游戏中奖")
+                new_balance = user['balance']
+                
+                self.send_message(chat_id,
+                    f"🎲 <b>开奖结果：</b>\n"
+                    f"{dice1}+{dice2}+{dice3}={total} {result}\n\n"
+                    f"🎉 <b>恭喜中奖！</b>\n"
+                    f"赢得金额: {win_amount:.2f}\n"
+                    f"💰 余额: {new_balance:.2f}\n\n"
+                    f"继续下注赢取更多奖励！"
+                )
+            else:
+                self.send_message(chat_id,
+                    f"🎲 <b>开奖结果：</b>\n"
+                    f"{dice1}+{dice2}+{dice3}={total} {result}\n\n"
+                    f"❌ <b>未中奖</b>\n"
+                    f"💰 余额: {user['balance']:.2f}\n\n"
+                    f"下次好运！"
+                )
+    
+    def get_updates(self):
+        try:
+            url = f"{self.base_url}/getUpdates"
+            params = {
+                "offset": self.last_update_id + 1,
+                "timeout": 30
+            }
+            response = requests.get(url, params=params, timeout=35)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    return data.get("result", [])
+        except Exception as e:
+            logger.error(f"获取更新失败: {e}")
+        
+        return []
+    
+    def run(self):
+        logger.info("开始轮询消息...")
+        try:
+            while True:
+                updates = self.get_updates()
+                for update in updates:
+                    self.last_update_id = update["update_id"]
+                    if "message" in update:
+                        self.process_message(update["message"])
+                
+                if not updates:
+                    time.sleep(1)
+                    
+        except KeyboardInterrupt:
+            logger.info("机器人停止")
+        except Exception as e:
+            logger.error(f"运行错误: {e}")
+            time.sleep(5)
+            self.run()  # 重启
+
+if __name__ == "__main__":
+    bot = GitHubCasinoBot()
+    bot.run()
